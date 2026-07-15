@@ -88,6 +88,26 @@ def generate_alias_name(original_name: str, existing_names: set) -> str:
     return alias_name
 
 
+def _resolve_json_pointer(root_schema: Optional[Dict], ref: str) -> Optional[Dict]:
+    """
+    Resolve a local JSON Pointer (e.g. '#/properties/foo/items') against the
+    root schema document. Returns None if it can't be resolved, so callers can
+    fall back to the legacy $defs-based lookup.
+    """
+    if root_schema is None or not ref.startswith("#/"):
+        return None
+    node: Any = root_schema
+    for part in ref[2:].split("/"):
+        part = part.replace("~1", "/").replace("~0", "~")
+        if isinstance(node, dict) and part in node:
+            node = node[part]
+        elif isinstance(node, list) and part.isdigit() and int(part) < len(node):
+            node = node[int(part)]
+        else:
+            return None
+    return node if isinstance(node, dict) else None
+
+
 def _process_schema_property(
     _model_cache: Dict[str, Type],
     prop_schema: Dict[str, Any],
@@ -95,6 +115,7 @@ def _process_schema_property(
     prop_name: str,
     is_required: bool,
     schema_defs: Optional[Dict] = None,
+    root_schema: Optional[Dict] = None,
 ) -> tuple[Union[Type, List, ForwardRef, Any], FieldInfo]:
     """
     Recursively processes a schema property to determine its Python type hint
@@ -119,9 +140,18 @@ def _process_schema_property(
             if prefix_path.startswith(ref_path):
                 # TODO: Find the exact type hint for the $ref.
                 return Any, Field(default=None, description="")
-        ref = ref.split("/")[-1]
-        assert ref in schema_defs, "Custom field not found"
-        prop_schema = schema_defs[ref]
+        resolved_schema = _resolve_json_pointer(root_schema, ref)
+        if resolved_schema is not None:
+            # Local pointer to another part of the schema (e.g. some servers,
+            # like the .NET MCP SDK, deduplicate structurally identical
+            # sibling schemas this way instead of using $defs).
+            prop_schema = resolved_schema
+        else:
+            ref_name = ref.split("/")[-1]
+            assert schema_defs is not None and ref_name in schema_defs, (
+                "Custom field not found"
+            )
+            prop_schema = schema_defs[ref_name]
 
     prop_type = prop_schema.get("type")
     prop_desc = prop_schema.get("description", "")
@@ -141,6 +171,7 @@ def _process_schema_property(
                 f"choice_{i}",
                 False,
                 schema_defs=schema_defs,
+                root_schema=root_schema,
             )
             type_hints.append(type_hint)
         return Union[tuple(type_hints)], pydantic_field
@@ -160,6 +191,7 @@ def _process_schema_property(
                 prop_name,
                 False,
                 schema_defs=schema_defs,
+                root_schema=root_schema,
             )
             type_hints.append(type_hint)
 
@@ -187,6 +219,7 @@ def _process_schema_property(
                 name,
                 is_nested_required,
                 schema_defs,
+                root_schema=root_schema,
             )
 
             if name_needs_alias(name):
@@ -225,6 +258,7 @@ def _process_schema_property(
             "item",
             False,  # Items aren't required at this level,
             schema_defs,
+            root_schema=root_schema,
         )
         list_type_hint = List[item_type_hint]
         return list_type_hint, pydantic_field
@@ -243,7 +277,9 @@ def _process_schema_property(
         return Any, pydantic_field
 
 
-def get_model_fields(form_model_name, properties, required_fields, schema_defs=None):
+def get_model_fields(
+    form_model_name, properties, required_fields, schema_defs=None, root_schema=None
+):
     model_fields = {}
 
     _model_cache: Dict[str, Type] = {}
@@ -257,6 +293,7 @@ def get_model_fields(form_model_name, properties, required_fields, schema_defs=N
             param_name,
             is_required,
             schema_defs,
+            root_schema=root_schema,
         )
 
         # Handle parameter names with leading underscores (e.g., __top, __filter) which Pydantic v2 does not allow
